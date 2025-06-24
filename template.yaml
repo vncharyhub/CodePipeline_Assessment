@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Cloud AI Service Pipeline: CodePipeline, API Gateway HTTP API, Lambda, Secrets Manager, and IAM roles
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub username or organization owning the repo
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch name to trigger pipeline on
+  GitHubOAuthToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub OAuth Token with repo permissions
+
+Resources:
+
+  # Secrets Manager secret with dummy API keys for Bedrock and Azure
+  AIServiceSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: AIServiceSecrets
+      Description: API keys for Bedrock and Azure OpenAI
+      SecretString: !Sub |
+        {
+          "bedrock_api_key": "DUMMY_BEDROCK_KEY",
+          "azure_api_key": "DUMMY_AZURE_KEY",
+          "azure_endpoint": "https://your-azure-openai-endpoint"
+        }
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "MultiCloudLambdaExecutionRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSecretsAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AIServiceSecret
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Lambda Function
+  MultiCloudLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "MultiCloudAIFunction-${AWS::StackName}"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          secrets_client = boto3.client('secretsmanager')
+
+          SECRET_NAME = os.environ.get("SECRET_NAME")
+
+          def get_secrets():
+              try:
+                  response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+                  secret = json.loads(response['SecretString'])
+                  return secret
+              except ClientError as e:
+                  logger.error(f"Error retrieving secrets: {e}")
+                  raise e
+
+          def call_bedrock_api(prompt, api_key):
+              # Placeholder for actual Bedrock call
+              # Here, just simulating a response
+              return {"response": f"Bedrock response to '{prompt}'"}
+
+          def call_azure_openai(prompt, api_key, endpoint):
+              # Placeholder for Azure OpenAI API call
+              # Demonstrates secure usage of key and endpoint
+              return {"response": f"Azure OpenAI response to '{prompt}'"}
+
+          def lambda_handler(event, context):
+              try:
+                  if event.get('httpMethod') != 'POST':
+                      return {
+                          "statusCode": 405,
+                          "body": json.dumps({"error": "Method Not Allowed, only POST supported"})
+                      }
+
+                  body = json.loads(event.get('body', '{}'))
+                  prompt = body.get('prompt')
+                  target_model = body.get('target_model')
+
+                  if not prompt or not target_model:
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "Missing 'prompt' or 'target_model' in request body"})
+                      }
+
+                  secrets = get_secrets()
+
+                  if target_model.lower() == 'bedrock':
+                      response = call_bedrock_api(prompt, secrets['bedrock_api_key'])
+                  elif target_model.lower() == 'azure':
+                      response = call_azure_openai(prompt, secrets['azure_api_key'], secrets['azure_endpoint'])
+                  else:
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "Invalid target_model, choose 'bedrock' or 'azure'"})
+                      }
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps(response)
+                  }
+              except Exception as e:
+                  logger.error(f"Exception: {e}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({"error": "Internal server error"})
+                  }
+
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref AIServiceSecret
+
+  # API Gateway HTTP API
+  MultiCloudHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "MultiCloudAIHttpApi-${AWS::StackName}"
+      ProtocolType: HTTP
+
+  # API Gateway Integration with Lambda
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MultiCloudHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt MultiCloudLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  # API Gateway Route for POST /
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MultiCloudHttpApi
+      RouteKey: "POST /"
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  # API Gateway Deployment and Stage
+  ApiDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn: ApiRoute
+    Properties:
+      ApiId: !Ref MultiCloudHttpApi
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref MultiCloudHttpApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      AutoDeploy: true
+
+  # IAM Role for CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "MultiCloudCodePipelineRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - iam:PassRole
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  # CodeBuild Role
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "MultiCloudCodeBuildRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: "*"
+
+  # CodeBuild Project (Optional build stage for lint/tests)
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "MultiCloudBuildProject-${AWS::StackName}"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - pip install pylint
+            build:
+              commands:
+                - pylint lambda_function.py || true  # Lint the lambda function (allow warnings)
+          artifacts:
+            files:
+              - '**/*'
+
+  # CodePipeline Artifact Store
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub_Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+                PollForSourceChanges: true
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: CloudFormation_Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "MultiCloudAIStack-${AWS::StackName}"
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: BuildOutput::template.yaml
+              RunOrder: 1
+
+Outputs:
+  ApiEndpoint:
+    Description: "Invoke URL for the API Gateway HTTP API"
+    Value: !Sub "https://${MultiCloudHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
